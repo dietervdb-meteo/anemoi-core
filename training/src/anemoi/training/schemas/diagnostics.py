@@ -321,6 +321,15 @@ class TimeLimitSchema(BaseModel):
     "File to record the last checkpoint to on exit, if set."
 
 
+class StopOnNaNSchema(BaseModel):
+    target_: Literal["anemoi.training.diagnostics.callbacks.stopping.StopOnNaN"] = Field(alias="_target_")
+    "StopOnNaN object from anemoi training diagnostics callbacks."
+    every_n_train_steps: int = Field(default=0, ge=0)
+    "Check training loss for NaN every N global optimiser steps. Set to 0 to disable per-step checking."
+    check_validation: bool = Field(default=False)
+    "Check all val_*_loss metrics for NaN after each validation epoch."
+
+
 class EarlyStoppingSchema(BaseModel):
     target_: Literal["anemoi.training.diagnostics.callbacks.stopping.EarlyStopping"] = Field(alias="_target_")
     monitor: str = Field(examples=["val_wmse_epoch", "val_wmse/sfc_2t/1"])

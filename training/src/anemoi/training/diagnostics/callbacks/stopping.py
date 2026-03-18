@@ -14,6 +14,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytorch_lightning as pl
+import torch
 from omegaconf import DictConfig
 from pytorch_lightning.utilities import rank_zero_only
 
@@ -98,6 +99,82 @@ class TimeLimit(pl.callbacks.Callback):
                 self._record_file.unlink()
 
             Path(self._record_file).write_text(str(last_checkpoint))
+
+
+class StopOnNaN(pl.callbacks.Callback):
+    """Stop training immediately when a NaN loss is detected.
+
+    Two independent checks are available and can be combined:
+
+    * **Per-step** (``every_n_train_steps > 0``) — inspects the scalar training
+      loss returned by ``training_step`` every *N* global optimiser steps.
+    * **Per-validation-epoch** (``check_validation=True``) — after each
+      validation epoch, scans all logged ``val_*_loss`` metrics for NaN.
+
+    Add it to ``config.diagnostics.callbacks``:
+
+    .. code-block:: yaml
+
+        diagnostics:
+          callbacks:
+            - _target_: anemoi.training.diagnostics.callbacks.stopping.StopOnNaN
+              every_n_train_steps: 0   # 0 = disabled; e.g. 500 to check every 500 steps
+              check_validation: true   # check val_*_loss metrics after each validation epoch
+
+    When a NaN is detected ``trainer.should_stop`` is set to ``True``.
+    PyTorch Lightning synchronises this flag across all DDP ranks at the next
+    epoch boundary, so training stops cleanly without manual rank coordination.
+    """
+
+    def __init__(
+        self,
+        config: DictConfig,
+        every_n_train_steps: int = 0,
+        check_validation: bool = False,
+    ) -> None:
+        super().__init__()
+        self.every_n_train_steps = every_n_train_steps
+        self.check_validation = check_validation
+
+    def _stop(self, trainer: pl.Trainer, message: str) -> None:
+        LOGGER.error("NaN detected — stopping training. %s", message)
+        trainer.should_stop = True
+
+    def on_train_batch_end(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        outputs: torch.Tensor,
+        batch: dict,
+        batch_idx: int,
+    ) -> None:
+        if self.every_n_train_steps <= 0:
+            return
+        if trainer.global_step == 0 or trainer.global_step % self.every_n_train_steps != 0:
+            return
+        if isinstance(outputs, torch.Tensor) and torch.isnan(outputs).any():
+            self._stop(
+                trainer,
+                f"Training loss is NaN at global step {trainer.global_step} (batch {batch_idx}).",
+            )
+
+    def on_validation_epoch_end(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+    ) -> None:
+        if not self.check_validation:
+            return
+        nan_keys = [
+            key
+            for key, val in trainer.callback_metrics.items()
+            if "val" in key and "loss" in key and torch.isnan(val)
+        ]
+        if nan_keys:
+            self._stop(
+                trainer,
+                f"Validation metric(s) are NaN at epoch {trainer.current_epoch}: {nan_keys}.",
+            )
 
 
 class EarlyStopping(pl.callbacks.EarlyStopping):
