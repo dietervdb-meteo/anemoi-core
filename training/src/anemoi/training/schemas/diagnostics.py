@@ -330,6 +330,15 @@ class StopOnNaNSchema(BaseModel):
     "Check all val_*_loss metrics for NaN after each validation epoch."
 
 
+class GradientMonitorSchema(BaseModel):
+    target_: Literal["anemoi.training.diagnostics.callbacks.gradient.GradientMonitor"] = Field(alias="_target_")
+    "GradientMonitor object from anemoi training diagnostics callbacks."
+    every_n_steps: int = Field(default=100, ge=1)
+    "Log global gradient L2 norm every N global optimiser steps."
+    log_scaler: bool = Field(default=False)
+    "Also log the AMP GradScaler scale factor when active."
+
+
 class EarlyStoppingSchema(BaseModel):
     target_: Literal["anemoi.training.diagnostics.callbacks.stopping.EarlyStopping"] = Field(alias="_target_")
     monitor: str = Field(examples=["val_wmse_epoch", "val_wmse/sfc_2t/1"])
