@@ -34,6 +34,8 @@ class GraphTransformerEncoderSchema(TransformerModelComponent):
     "Edge attributes to consider in the encoder features."
     qk_norm: bool = Field(example=False)
     "Normalize the query and key vectors. Default to False."
+    attn_logit_fp32: bool = Field(example=False)
+    "Cast Q/K to fp32 before the attention kernel to prevent softmax mantissa collapse in bf16. Default to False."
 
     @model_validator(mode="after")
     def check_valid_extras(self) -> Any:

@@ -34,6 +34,8 @@ class GraphTransformerDecoderSchema(TransformerModelComponent):
     "Edge attributes to consider in the decoder features. Default to [edge_length, edge_dirs]"
     qk_norm: bool = Field(example=False)
     "Normalize the query and key vectors. Default to False."
+    attn_logit_fp32: bool = Field(example=False)
+    "Cast Q/K to fp32 before the attention kernel to prevent softmax mantissa collapse in bf16. Default to False."
     initialise_data_extractor_zero: bool = Field(example=False)
     "Initialise the data extractor with zeros. Default to False."
 

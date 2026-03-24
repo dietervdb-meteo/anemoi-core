@@ -446,6 +446,7 @@ class GraphTransformerBaseBlock(BaseBlock, ABC):
         edge_dim: int,
         bias: bool = True,
         qk_norm: bool = False,
+        attn_logit_fp32: bool = False,
         update_src_nodes: bool = False,
         layer_kernels: DotDict,
         graph_attention_backend: str = "triton",
@@ -536,6 +537,15 @@ class GraphTransformerBaseBlock(BaseBlock, ABC):
         else:
             self.conv = GraphTransformerConv(out_channels=self.out_channels_conv)
 
+        LOGGER.info("%s qk_norm=%s.", self.__class__.__name__, self.qk_norm)
+        self.attn_logit_fp32 = attn_logit_fp32
+        LOGGER.info(
+            "%s attn_logit_fp32=%s — attention will run in %s.",
+            self.__class__.__name__,
+            self.attn_logit_fp32,
+            "fp32 (softmax-collapse fix active)" if self.attn_logit_fp32 else "AMP dtype",
+        )
+
     def run_node_dst_mlp(self, x, **layer_kwargs):
         return self.node_dst_mlp(self.layer_norm_mlp_dst(x, **layer_kwargs))
 
@@ -604,6 +614,16 @@ class GraphTransformerBaseBlock(BaseBlock, ABC):
         # self.conv requires size to be a tuple
         conv_size = (size, size) if isinstance(size, int) else size
 
+        # Cast all attention tensors to fp32 when attn_logit_fp32 is set, to
+        # prevent softmax mantissa collapse in bf16/f16 AMP.  Output is cast
+        # back to preserve the downstream AMP dtype.
+        amp_dtype = value.dtype
+        if self.attn_logit_fp32 and amp_dtype != torch.float32:
+            query = query.to(torch.float32)
+            key = key.to(torch.float32)
+            value = value.to(torch.float32)
+            edges = edges.to(torch.float32)
+
         if self.graph_attention_backend == "triton":
             csc, perm, reverse = edge_index_to_csc(edge_index, num_nodes=conv_size, reverse=True)
             edges_csc = edges.index_select(0, perm)
@@ -611,7 +631,12 @@ class GraphTransformerBaseBlock(BaseBlock, ABC):
         else:
             args_conv = (edges, edge_index, conv_size)
 
-        return self.conv(query, key, value, *args_conv)
+        out = self.conv(query, key, value, *args_conv)
+
+        if self.attn_logit_fp32 and out.dtype != amp_dtype:
+            out = out.to(amp_dtype)
+
+        return out
 
     def attention_block(
         self,
