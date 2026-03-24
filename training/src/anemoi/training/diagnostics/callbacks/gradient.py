@@ -17,6 +17,14 @@ from pytorch_lightning.utilities import rank_zero_only
 
 LOGGER = logging.getLogger(__name__)
 
+# Parameter name suffixes tracked by WeightNormMonitor.
+_WEIGHT_NORM_SUFFIXES = (
+    "lin_query.weight",
+    "lin_key.weight",
+    "q_norm.weight",
+    "k_norm.weight",
+)
+
 
 class GradientMonitor(pl.callbacks.Callback):
     """Monitor gradient norms and (optionally) AMP scaler scale during training.
@@ -93,3 +101,61 @@ class GradientMonitor(pl.callbacks.Callback):
                     {"train/grad_scaler_scale": scaler.get_scale()},
                     step=trainer.global_step,
                 )
+
+
+class WeightNormMonitor(pl.callbacks.Callback):
+    """Monitor L2 norms of selected attention projection weights during training.
+
+    Logs the L2 norm of every parameter whose fully-qualified name ends with one
+    of the suffixes in ``_WEIGHT_NORM_SUFFIXES`` (currently ``lin_query.weight``,
+    ``lin_key.weight``, ``q_norm.weight``, ``k_norm.weight``).
+
+    These four parameters together tell the story of attention logit magnitude:
+
+    * **Without qk_norm** (``qk_norm=False``): ``lin_query.weight`` and
+      ``lin_key.weight`` norms grow proportionally to softmax logit std.
+    * **With qk_norm** (``qk_norm=True``): ``lin_query.weight`` norm is
+      not informative.  Instead, ``q_norm.weight`` and ``k_norm.weight`` are
+      the direct proxy: effective logit std ≈ mean(q_norm.weight) × mean(k_norm.weight) × √d_head.
+
+    Metrics are logged to MLflow (or any Lightning logger) as
+    ``weight_norm/<param_path_without_.weight_suffix>``.
+
+    Add to ``config.diagnostics.callbacks``:
+
+    .. code-block:: yaml
+
+        diagnostics:
+          callbacks:
+            - _target_: anemoi.training.diagnostics.callbacks.gradient.WeightNormMonitor
+              every_n_steps: 100
+
+    """
+
+    def __init__(
+        self,
+        config: DictConfig,
+        every_n_steps: int = 100,
+    ) -> None:
+        super().__init__()
+        self.every_n_steps = every_n_steps
+
+    @rank_zero_only
+    def on_before_optimizer_step(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        optimizer: object,
+    ) -> None:
+        if self.every_n_steps <= 0 or trainer.global_step % self.every_n_steps != 0:
+            return
+
+        metrics: dict[str, float] = {}
+        for name, param in pl_module.named_parameters():
+            if any(name.endswith(sfx) for sfx in _WEIGHT_NORM_SUFFIXES):
+                key = "weight_norm/" + name[: -len(".weight")]
+                metrics[key] = param.detach().norm(2.0).item()
+
+        if metrics:
+            trainer.logger.log_metrics(metrics, step=trainer.global_step)
+            LOGGER.debug("logged %d weight norms at step %d", len(metrics), trainer.global_step)
