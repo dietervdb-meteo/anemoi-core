@@ -413,6 +413,8 @@ class BaseTrainingSchema(BaseModel):
     " reproducibility."
     precision: str = Field(default="16-mixed")
     "Precision"
+    preferred_blas_backend: str | None = Field(default=None)
+    "Override PyTorch's BLAS backend selection. On ROCm/torch2.9+, PyTorch defaults to hipBLASLt which silently drops fp16 subnormal preservation in backward passes. Setting this to 'cublas' forces rocBLAS and restores the fp16_alt_impl path. None = use PyTorch default."
     multistep_input: PositiveInt = Field(example=2)
     """Number of input steps for the model.
     E.g. 1 = single step scheme, X(t-1) used to predict X(t) and possible later steps,

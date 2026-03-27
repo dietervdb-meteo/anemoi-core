@@ -48,6 +48,44 @@ LOGGER = logging.getLogger(__name__)
 PL_VERSION = version.parse(pl.__version__)
 
 
+def _probe_fp16_blas_backend() -> None:
+    """Probe whether the active BLAS backend preserves fp16 subnormals in backward passes.
+
+    Runs a minimal fp16 backward GEMM (64×64) and checks whether a subnormal input value
+    survives the weight-gradient computation. On ROCm, rocBLAS sets the fp16_alt_impl flag
+    which prevents FTZ flushing; hipBLASLt (torch2.9+ default) does not, causing silent
+    loss of subnormals. The result is logged as a WARNING so it appears prominently in
+    SLURM logs regardless of the configured log level.
+    """
+    if not torch.cuda.is_available():
+        return
+    device = torch.device("cuda")
+    dtype = torch.float16
+    N = 64
+    sub_val = torch.finfo(dtype).tiny / 2  # a genuine f16 subnormal
+    ref = N * sub_val                      # expected result if subnormals survive
+    x     = torch.ones(N, N, dtype=dtype, device=device)
+    w     = torch.nn.Parameter(torch.ones(N, N, dtype=dtype, device=device))
+    d_out = torch.full((N, N), sub_val, dtype=dtype, device=device)
+    (x @ w).backward(d_out)
+    torch.cuda.synchronize()
+    result = w.grad[0, 0].item()
+    ratio = result / ref if ref > 0 else float("nan")
+    if ratio > 0.9:
+        LOGGER.warning(
+            "fp16 BLAS probe: subnormals PRESERVED in backward GEMM (ratio=%.4f) "
+            "— rocBLAS fp16_alt_impl active.",
+            ratio,
+        )
+    else:
+        LOGGER.warning(
+            "fp16 BLAS probe: subnormals FLUSHED in backward GEMM (ratio=%.4f) "
+            "— hipBLASLt path active, no fp16_alt_impl. "
+            "Set training.preferred_blas_backend: cublas to restore subnormal preservation.",
+            ratio,
+        )
+
+
 class AnemoiTrainer(ABC):
     """Utility class for training the model."""
 
@@ -63,6 +101,20 @@ class AnemoiTrainer(ABC):
         # Allow for lower internal precision of float32 matrix multiplications.
         # This can increase performance (and TensorCore usage, where available).
         torch.set_float32_matmul_precision("high")
+        # Optionally override the BLAS backend. On ROCm/torch2.9+, PyTorch defaults to hipBLASLt
+        # which silently drops fp16 subnormal preservation in backward GEMMs. Setting
+        # training.preferred_blas_backend: "cublas" restores the rocBLAS fp16_alt_impl path.
+        _blas_backend = OmegaConf.select(config, "training.preferred_blas_backend")
+        if _blas_backend:
+            if hasattr(torch.backends.cuda, "preferred_blas_library"):
+                torch.backends.cuda.preferred_blas_library(_blas_backend)
+                LOGGER.warning("BLAS backend forced to %r (config.training.preferred_blas_backend)", _blas_backend)
+            else:
+                LOGGER.warning(
+                    "config.training.preferred_blas_backend=%r ignored: API unavailable in this PyTorch version",
+                    _blas_backend,
+                )
+        _probe_fp16_blas_backend()
         # Resolve the config to avoid shenanigans with lazy loading
 
         if config.config_validation:
