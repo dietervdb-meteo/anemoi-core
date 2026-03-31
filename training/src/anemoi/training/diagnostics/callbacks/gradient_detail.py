@@ -20,7 +20,7 @@ from pytorch_lightning.utilities import rank_zero_only
 
 LOGGER = logging.getLogger(__name__)
 
-# Sub-module names inside a GraphTransformer block tracked individually.
+# Sub-module names inside a processor GraphTransformer block tracked individually.
 _GT_SUBS: frozenset[str] = frozenset(
     [
         "lin_key",
@@ -33,6 +33,10 @@ _GT_SUBS: frozenset[str] = frozenset(
     ]
 )
 
+# Sub-module names tracked within encoder and decoder blocks.
+# Superset of _GT_SUBS: encoder/decoder also have lin_self and projection.
+_ENC_DEC_SUBS: frozenset[str] = _GT_SUBS | frozenset(["lin_self", "projection"])
+
 
 class PerLayerGradientMonitor(pl.callbacks.Callback):
     """Per-module-group gradient norm monitor for diagnosing training instability.
@@ -40,12 +44,17 @@ class PerLayerGradientMonitor(pl.callbacks.Callback):
     Logs gradient norms broken down by model component every ``every_n_steps``
     global optimizer steps:
 
-    * Each main processor layer — ``proc.{N}`` (aggregate of the full block)
-    * Key sub-modules within each processor layer: ``lin_key``, ``lin_query``,
+    * Processor aggregate — ``processor`` (all parameters across all N blocks)
+    * Each main processor block — ``proc.{N}`` (aggregate of the full block)
+    * Key sub-modules within each processor block — ``proc.{N}.{sub}`` for each
+      sub in ``_GT_SUBS`` that is present: ``lin_key``, ``lin_query``,
       ``lin_value``, ``lin_edge``, ``edge_pre_mlp``, ``node_dst_mlp``,
-      ``node_src_mlp`` (only those present in the model)
-    * Encoder (aggregate over all encoder parameters)
-    * Decoder (aggregate over all decoder parameters)
+      ``node_src_mlp``
+    * Encoder aggregate — ``encoder`` (all encoder parameters)
+    * Encoder sub-modules — ``encoder.{sub}`` for each sub in ``_ENC_DEC_SUBS``
+      that is present (superset of ``_GT_SUBS``: also ``lin_self``, ``projection``)
+    * Decoder aggregate — ``decoder`` (all decoder parameters)
+    * Decoder sub-modules — ``decoder.{sub}`` for each sub in ``_ENC_DEC_SUBS``
     * Global L2 norm (mirrors ``GradientMonitor`` — logged as ``train/grad_norm``)
     * AMP GradScaler scale — logged every step unconditionally when ``log_scaler``
       is True, regardless of ``every_n_steps``
@@ -99,6 +108,9 @@ class PerLayerGradientMonitor(pl.callbacks.Callback):
 
         Groups produced
         ---------------
+        ``processor``
+            All parameters belonging to any processor layer (aggregate over
+            all N blocks).
         ``proc.{N}``
             All parameters belonging to main processor layer N
             (path contains ``processor.proc.{N}.``).
@@ -107,10 +119,16 @@ class PerLayerGradientMonitor(pl.callbacks.Callback):
             sub in ``_GT_SUBS`` that is present.
         ``encoder``
             All parameters whose path contains ``encoder.`` but not
-            ``processor.proc.``.
+            ``processor.proc.`` (aggregate).
+        ``encoder.{sub}``
+            Parameters in sub-module *sub* of the encoder block, for each
+            sub in ``_ENC_DEC_SUBS`` that is present.
         ``decoder``
             All parameters whose path contains ``decoder.`` but not
-            ``processor.proc.``.
+            ``processor.proc.`` (aggregate).
+        ``decoder.{sub}``
+            Parameters in sub-module *sub* of the decoder block, for each
+            sub in ``_ENC_DEC_SUBS`` that is present.
         """
         groups: dict[str, list[torch.nn.Parameter]] = {}
         # Named-parameter iteration gives DDP-unwrapped names in Lightning.
@@ -125,6 +143,7 @@ class PerLayerGradientMonitor(pl.callbacks.Callback):
                 m = re.search(r"processor\.proc\.(\d+)\.", name)
                 if m:
                     layer_key = f"proc.{m.group(1)}"
+                    groups.setdefault("processor", []).append(param)
                     groups.setdefault(layer_key, []).append(param)
 
                     # Sub-module within this processor layer.
@@ -135,9 +154,21 @@ class PerLayerGradientMonitor(pl.callbacks.Callback):
 
             elif "encoder." in name:
                 groups.setdefault("encoder", []).append(param)
+                # Per-sublayer breakdown for the encoder block.
+                m = re.search(r"encoder\..*?\.proc\.", name)
+                if m:
+                    sub = name[m.end():].split(".")[0]
+                    if sub in _ENC_DEC_SUBS:
+                        groups.setdefault(f"encoder.{sub}", []).append(param)
 
             elif "decoder." in name:
                 groups.setdefault("decoder", []).append(param)
+                # Per-sublayer breakdown for the decoder block.
+                m = re.search(r"decoder\..*?\.proc\.", name)
+                if m:
+                    sub = name[m.end():].split(".")[0]
+                    if sub in _ENC_DEC_SUBS:
+                        groups.setdefault(f"decoder.{sub}", []).append(param)
 
         n_proc = sum(1 for k in groups if re.fullmatch(r"proc\.\d+", k))
         subs_found = sorted(
