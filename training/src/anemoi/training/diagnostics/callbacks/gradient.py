@@ -104,22 +104,44 @@ class GradientMonitor(pl.callbacks.Callback):
 
 
 class WeightNormMonitor(pl.callbacks.Callback):
-    """Monitor L2 norms of selected attention projection weights during training.
+    """Monitor attention weight norms, Adam state, and gradient-radial projections.
 
-    Logs the L2 norm of every parameter whose fully-qualified name ends with one
-    of the suffixes in ``_WEIGHT_NORM_SUFFIXES`` (currently ``lin_query.weight``,
-    ``lin_key.weight``, ``q_norm.weight``, ``k_norm.weight``).
+    For every parameter whose fully-qualified name ends with one of the suffixes
+    in ``_WEIGHT_NORM_SUFFIXES`` (``lin_query.weight``, ``lin_key.weight``,
+    ``q_norm.weight``, ``k_norm.weight``), logs:
 
-    These four parameters together tell the story of attention logit magnitude:
+    **Weight norm** (``weight_norm/<param_path>``)
+        L2 norm of the weight tensor.  Primary observable for logit-scale drift.
 
-    * **Without qk_norm** (``qk_norm=False``): ``lin_query.weight`` and
-      ``lin_key.weight`` norms grow proportionally to softmax logit std.
-    * **With qk_norm** (``qk_norm=True``): ``lin_query.weight`` norm is
-      not informative.  Instead, ``q_norm.weight`` and ``k_norm.weight`` are
-      the direct proxy: effective logit std ≈ mean(q_norm.weight) × mean(k_norm.weight) × √d_head.
+    **Gradient radial projection** (``train/radial/<param_path>``, optional)
+        Signed projection of the gradient onto the weight vector, normalised by
+        the weight norm:  ``(g · W) / ‖W‖``.
 
-    Metrics are logged to MLflow (or any Lightning logger) as
-    ``weight_norm/<param_path_without_.weight_suffix>``.
+        * Negative  → gradient is restoring norm (pulling weight back toward origin).
+        * Near zero → gradient is tangential; norm is at equilibrium.
+        * Positive  → gradient is extending norm (pushing weight further out).
+
+        Persistently positive values in a run indicate the optimiser's restoring
+        force is insufficient — the Phase 1 equilibrium-disruption signature.
+
+    **Adam first moment norm** (``train/adam_m1/<param_path>``, optional)
+        L2 norm of the exponential moving average of gradients (``exp_avg``).
+        Captures momentum accumulated across steps; remains non-zero even after
+        the instantaneous gradient collapses (Phase 2 runaway diagnostic).
+
+    **Adam second moment norm** (``train/adam_v2/<param_path>``, optional)
+        L2 norm of ``exp_avg_sq``.  Together with ``m1``, allows computing the
+        effective per-element step magnitude.
+
+    **Adam effective step norm** (``train/adam_eff/<param_path>``, optional)
+        L2 norm of ``m1 / (sqrt(v2) + eps)``.  This is proportional to the
+        actual weight update vector; if this is large while ``‖grad‖`` is small,
+        Adam momentum is driving norm growth independently of the current gradient.
+
+    The last four metrics require ``log_adam=True`` / ``log_radial=True``
+    respectively.  They are off by default to avoid log bloat in production runs.
+
+    Metrics are logged to MLflow (or any Lightning logger).
 
     Add to ``config.diagnostics.callbacks``:
 
@@ -128,7 +150,9 @@ class WeightNormMonitor(pl.callbacks.Callback):
         diagnostics:
           callbacks:
             - _target_: anemoi.training.diagnostics.callbacks.gradient.WeightNormMonitor
-              every_n_steps: 100
+              every_n_steps: 50
+              log_radial: true
+              log_adam: true
 
     """
 
@@ -136,9 +160,13 @@ class WeightNormMonitor(pl.callbacks.Callback):
         self,
         config: DictConfig,
         every_n_steps: int = 100,
+        log_radial: bool = False,
+        log_adam: bool = False,
     ) -> None:
         super().__init__()
         self.every_n_steps = every_n_steps
+        self.log_radial = log_radial
+        self.log_adam = log_adam
 
     @rank_zero_only
     def on_before_optimizer_step(
@@ -152,10 +180,36 @@ class WeightNormMonitor(pl.callbacks.Callback):
 
         metrics: dict[str, float] = {}
         for name, param in pl_module.named_parameters():
-            if any(name.endswith(sfx) for sfx in _WEIGHT_NORM_SUFFIXES):
-                key = "weight_norm/" + name[: -len(".weight")]
-                metrics[key] = param.detach().norm(2.0).item()
+            if not any(name.endswith(sfx) for sfx in _WEIGHT_NORM_SUFFIXES):
+                continue
+
+            key = name[: -len(".weight")]
+            w = param.detach()
+            metrics[f"weight_norm/{key}"] = w.norm(2.0).item()
+
+            # Gradient radial projection: (g · W) / ‖W‖
+            # Positive = gradient extends norm; negative = restores norm.
+            if self.log_radial and param.grad is not None:
+                g = param.grad.detach()
+                w_norm = w.norm(2.0)
+                if w_norm > 0:
+                    metrics[f"train/radial/{key}"] = (
+                        torch.dot(g.flatten(), w.flatten()) / w_norm
+                    ).item()
+
+            # Adam internal state.
+            if self.log_adam:
+                opt_state = optimizer.state.get(param, {})
+                m1 = opt_state.get("exp_avg")
+                v2 = opt_state.get("exp_avg_sq")
+                if m1 is not None:
+                    metrics[f"train/adam_m1/{key}"] = m1.norm(2.0).item()
+                if v2 is not None:
+                    metrics[f"train/adam_v2/{key}"] = v2.norm(2.0).item()
+                if m1 is not None and v2 is not None:
+                    eff = (m1 / (v2.sqrt() + 1e-8)).norm(2.0).item()
+                    metrics[f"train/adam_eff/{key}"] = eff
 
         if metrics:
             trainer.logger.log_metrics(metrics, step=trainer.global_step)
-            LOGGER.debug("logged %d weight norms at step %d", len(metrics), trainer.global_step)
+            LOGGER.debug("logged %d weight/adam/radial metrics at step %d", len(metrics), trainer.global_step)
