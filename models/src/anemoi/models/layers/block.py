@@ -447,6 +447,7 @@ class GraphTransformerBaseBlock(BaseBlock, ABC):
         bias: bool = True,
         qk_norm: bool = False,
         attn_logit_fp32: bool = False,
+        attn_grad_fp32: bool = False,
         update_src_nodes: bool = False,
         layer_kernels: DotDict,
         graph_attention_backend: str = "triton",
@@ -539,12 +540,18 @@ class GraphTransformerBaseBlock(BaseBlock, ABC):
 
         LOGGER.info("%s qk_norm=%s.", self.__class__.__name__, self.qk_norm)
         self.attn_logit_fp32 = attn_logit_fp32
+        self.attn_grad_fp32 = attn_grad_fp32
         LOGGER.info(
             "%s attn_logit_fp32=%s — attention will run in %s.",
             self.__class__.__name__,
             self.attn_logit_fp32,
             "fp32 (softmax-collapse fix active)" if self.attn_logit_fp32 else "AMP dtype",
         )
+        if self.attn_grad_fp32:
+            LOGGER.info(
+                "%s attn_grad_fp32=True — backward gradients will be stored in fp32.",
+                self.__class__.__name__,
+            )
 
     def run_node_dst_mlp(self, x, **layer_kwargs):
         return self.node_dst_mlp(self.layer_norm_mlp_dst(x, **layer_kwargs))
@@ -631,7 +638,10 @@ class GraphTransformerBaseBlock(BaseBlock, ABC):
         else:
             args_conv = (edges, edge_index, conv_size)
 
-        out = self.conv(query, key, value, *args_conv)
+        if self.graph_attention_backend == "triton":
+            out = self.conv(query, key, value, *args_conv, self.attn_grad_fp32)
+        else:
+            out = self.conv(query, key, value, *args_conv)
 
         if self.attn_logit_fp32 and out.dtype != amp_dtype:
             out = out.to(amp_dtype)

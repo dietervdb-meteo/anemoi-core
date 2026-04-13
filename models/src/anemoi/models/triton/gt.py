@@ -87,10 +87,12 @@ def _gt_fwd(
     ROW_ptr,  # [M]
     COLPTR_ptr,  # [N_dst+1]
     OUT_ptr,  # [N_dst, H, C]
+    LOGITS_ptr,  # [M, H] diagnostic output — pre-softmax logits (qk * scale); only written when emit_logits=True
     N_dst,
     H: tl.constexpr,
     C: tl.constexpr,
     out_dtype: tl.constexpr,
+    emit_logits: tl.constexpr,  # whether to write to LOGITS_ptr
 ):
     pid = tl.program_id(0)
     dst_idx = pid
@@ -142,7 +144,11 @@ def _gt_fwd(
         v_e = v + e
 
         qk = tl.sum(q * k_e, axis=-1) * qk_scale  # Shape: [H]
-
+        # Optional diagnostic: store the raw (pre-softmax) scaled logit for
+        # this edge.  The store is dead-code-eliminated by Triton when
+        # emit_logits=False, so there is zero overhead in the normal path.
+        if emit_logits:
+            tl.store(LOGITS_ptr + e_idx * H + tl.arange(0, H_pad), qk, mask=H_mask)
         m_ij = tl.maximum(m_i, qk)  # new running max
         alpha_ij = tl.exp(qk - m_ij)  # attention weight for current edge
         correction = tl.exp(m_i - m_ij)  # correction factor for previous accumulations
@@ -381,6 +387,17 @@ def _gt_bwd_src_pass(
 class GraphTransformerFunction(torch.autograd.Function):
     """Custom autograd for GraphTransformer using Triton kernels."""
 
+    # ------------------------------------------------------------------
+    # Attention-logit capture (diagnostic only).
+    #
+    # Set GraphTransformerFunction.capture_logits = True before a forward
+    # pass; each _gt_fwd call appends a [M, H] float32 tensor to
+    # GraphTransformerFunction.captured_logits.  Clear the flag and list
+    # after reading.  The backward pass is entirely unaffected.
+    # ------------------------------------------------------------------
+    capture_logits: bool = False
+    captured_logits: list = []
+
     def __init__(self):
         if not torch.cuda.is_available():
             raise ValueError(
@@ -388,7 +405,7 @@ class GraphTransformerFunction(torch.autograd.Function):
             )
 
     @staticmethod
-    def forward(ctx, q, k, v, e, csc, reverse):
+    def forward(ctx, q, k, v, e, csc, reverse, grad_fp32=False):
         """Args:
         q: [N_dst, H, C]
         k: [N_src, H, C]
@@ -396,6 +413,10 @@ class GraphTransformerFunction(torch.autograd.Function):
         e: [num_edges, H, C]
         csc: (row, colptr)
         reverse: (rowptr, edge_ids, edge_dst)
+        grad_fp32: bool
+            When True, backward gradient outputs (dQ, dK, dV, dE) are stored
+            in fp32 regardless of the input dtype.  The forward output is
+            always stored in the input dtype.
         """
         row, colptr = csc
         rowptr, edge_ids, edge_dst = reverse
@@ -418,13 +439,28 @@ class GraphTransformerFunction(torch.autograd.Function):
             else:
                 raise ValueError(f"Unsupported dtype: {dtype}")
 
-        out_dtype = torch_dtype_to_triton(q.dtype)
-        ctx.out_dtype = out_dtype
+        fwd_out_dtype = torch_dtype_to_triton(q.dtype)
+        ctx.out_dtype = tl.float32 if grad_fp32 else fwd_out_dtype
+        ctx.grad_fp32 = grad_fp32
 
-        _gt_fwd[(N_dst,)](q, k, v, e, m, row, colptr, out, N_dst, H, C, out_dtype)
+        # Diagnostic logit capture: allocate [M, H] buffer if requested,
+        # otherwise pass 'out' as a harmless dummy pointer (never written).
+        emit_logits = GraphTransformerFunction.capture_logits
+        if emit_logits:
+            M = row.shape[0]
+            logits_buf = torch.empty((M, H), device=q.device, dtype=torch.float32)
+        else:
+            logits_buf = out  # dummy; tl.constexpr=False means store is DCE'd
 
-        # Save tensors for backward
+        _gt_fwd[(N_dst,)](q, k, v, e, m, row, colptr, out, logits_buf, N_dst, H, C, fwd_out_dtype, emit_logits)
+
         ctx.save_for_backward(q, k, v, e, out, m, row, colptr, rowptr, edge_ids, edge_dst)
+
+        if emit_logits:
+            # Store (logits, row) so the callback can reconstruct per-dst softmax.
+            # row is the CSC row-index array (edge→dst mapping); topology is fixed
+            # but cheap to save alongside each snapshot.
+            GraphTransformerFunction.captured_logits.append((logits_buf, row.cpu()))
         return out
 
     @staticmethod
@@ -436,11 +472,12 @@ class GraphTransformerFunction(torch.autograd.Function):
         N_src = k.shape[0]
 
         # Allocate grads and intermediates
-        dQ = torch.empty_like(q)
-        dK = torch.empty_like(k)
-        dV = torch.empty_like(v)
-        dE = torch.empty_like(e)
-        D = torch.empty((N_dst, H), device=q.device, dtype=q.dtype)
+        grad_dtype = torch.float32 if ctx.grad_fp32 else q.dtype
+        dQ = torch.empty(q.shape, device=q.device, dtype=grad_dtype)
+        dK = torch.empty(k.shape, device=k.device, dtype=grad_dtype)
+        dV = torch.empty(v.shape, device=v.device, dtype=grad_dtype)
+        dE = torch.empty(e.shape, device=e.device, dtype=grad_dtype)
+        D  = torch.empty((N_dst, H), device=q.device, dtype=grad_dtype)
 
         # Pass A: destination nodes (computes D and dQ)
         _gt_bwd_dst_pass[(N_dst,)](q, k, v, e, out, m, row, colptr, d_out, dQ, D, N_dst, H, C, ctx.out_dtype)
@@ -450,4 +487,4 @@ class GraphTransformerFunction(torch.autograd.Function):
             q, k, v, e, rowptr, edge_ids, edge_dst, D, m, d_out, dK, dV, dE, N_src, H, C, ctx.out_dtype
         )
 
-        return dQ, dK, dV, dE, None, None
+        return dQ, dK, dV, dE, None, None, None
